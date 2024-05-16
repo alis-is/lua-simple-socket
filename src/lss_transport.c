@@ -1,4 +1,5 @@
 #include <lua.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include "lss_transport.h"
 
