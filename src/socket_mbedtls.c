@@ -1,8 +1,8 @@
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "mbedtls/debug.h"
 #include "socket.h"
 #include "socket_mbedtls.h"
 #if defined(LSS_HAS_BUNDLED_ROOT_CERTIFICATES)
@@ -11,6 +11,10 @@
 #include <errno.h>
 #include "mbedtls/platform.h"
 #include "mbedtls/ssl.h"
+#if defined(MBEDTLS_DEBUG_C)
+#include "mbedtls/debug.h"
+#endif
+#include "psa/crypto.h"
 
 void
 free_connection(lss_tls_connection_context* context) {
@@ -28,6 +32,23 @@ free_connection(lss_tls_connection_context* context) {
 void
 mbedtlsDebugPrint(void* ctx, int level, const char* pFile, int line, const char* pStr) {
     printf("mbedtlsDebugPrint: |%d| %s\n", level, pStr);
+}
+
+void
+lssDebugPrint(lss_open_tls_connection_options* options, const char* format, ...) {
+    if (options == NULL || options->debugLevel <= 1) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format); // Initialize the va_list variable with the last fixed parameter
+
+    // Print the formatted string
+    printf("lssDebugPrint: ");
+    vprintf(format, args);
+    printf("\n");
+
+    va_end(args); // Clean up the va_list variable
 }
 
 lss_tls_connection_result
@@ -48,6 +69,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         options = &defaultOptions;
     }
 
+    psa_crypto_init(); // mbedtls 3.6.0+
     mbedtls_net_init(&result.context->socket);
     mbedtls_ssl_init(&result.context->ssl);
     mbedtls_ssl_config_init(&result.context->conf);
@@ -70,7 +92,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     if ((err = mbedtls_ssl_config_defaults(&result.context->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
                                            MBEDTLS_SSL_PRESET_DEFAULT))
         != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_config_defaults returned %d\n\n", err));
+        lssDebugPrint(options, "mbedtls_ssl_config_defaults failed with %d\n", err);
         result.error_num = err;
         result.error_source = ERR_SRC_MBEDTLS;
         goto exit;
@@ -95,7 +117,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         for (int i = 0; i < lss_cacertsCount; i++) {
             err = mbedtls_x509_crt_parse_der_nocopy(&result.context->cacert, lss_cacerts + shift, lss_cacertSizes[i]);
             if (err != 0) {
-                fprintf(stderr, "Mbedtls_Connect: mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
+                lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
                 result.error_num = err;
                 result.error_source = ERR_SRC_MBEDTLS;
                 goto exit;
@@ -109,7 +131,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
             err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->caCertificates->certificates[i],
                                              options->caCertificates->sizes[i]);
             if (err != 0) {
-                fprintf(stderr, "Mbedtls_Connect: mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
+                lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
                 result.error_num = err;
                 result.error_source = ERR_SRC_MBEDTLS;
                 goto exit;
@@ -121,7 +143,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->clientCertificate->certificate,
                                          options->clientCertificate->certificateSize);
         if (err != 0) {
-            fprintf(stderr, "Mbedtls_Connect: mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
+            lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
             result.error_num = err;
             result.error_source = ERR_SRC_MBEDTLS;
             goto exit;
@@ -131,14 +153,14 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
                                    options->clientCertificate->passwordSize, mbedtls_ctr_drbg_random,
                                    &result.context->ctr_drbg);
         if (err != 0) {
-            fprintf(stderr, "Mbedtls_Connect: mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
+            lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
             result.error_num = err;
             result.error_source = ERR_SRC_MBEDTLS;
             goto exit;
         }
         err = mbedtls_ssl_conf_own_cert(&result.context->conf, &result.context->clicert, &result.context->pkey);
         if (err != 0) {
-            fprintf(stderr, "Mbedtls_Connect: mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
+            lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
             result.error_num = err;
             result.error_source = ERR_SRC_MBEDTLS;
             goto exit;
@@ -150,7 +172,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     mbedtls_ssl_set_hostname(&result.context->ssl, hostname);
 
     if ((err = mbedtls_ssl_setup(&result.context->ssl, &result.context->conf)) != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_setup returned %d\n\n", err));
+        lssDebugPrint(options, "mbedtls_ssl_setup failed with %d\n", err);
         result.error_num = err;
         result.error_source = ERR_SRC_MBEDTLS;
         goto exit;
@@ -162,7 +184,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     _options.write_timeout = options->write_timeout;
     lss_connection_result connResult = lss_open_connection(hostname, portno, &_options);
     if (connResult.error_num != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_setup returned %d\n\n", connResult.error_num));
+        lssDebugPrint(options, "lss_open_connection failed with %d\n", connResult.error_num);
         result.error_num = connResult.error_num;
         result.error_source = connResult.error_source;
         goto exit;
@@ -173,26 +195,27 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     mbedtls_ssl_set_bio(&result.context->ssl, (void*)&result.context->socket, mbedtls_net_send, mbedtls_net_recv,
                         mbedtls_net_recv_timeout);
 
-    if ((err = mbedtls_ssl_conf_max_frag_len(&result.context->conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096)) != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_conf_max_frag_len returned %d\n\n", err));
-        result.error_num = err;
-        result.error_source = ERR_SRC_MBEDTLS;
-        goto exit;
-    }
+    // fails in 3.6.0 with tls1.3 - unsupported extension
+    // if ((err = mbedtls_ssl_conf_max_frag_len(&result.context->conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096)) != 0) {
+    //     lssDebugPrint(options, "mbedtls_ssl_conf_max_frag_len failed with %d\n", err);
+    //     result.error_num = err;
+    //     result.error_source = ERR_SRC_MBEDTLS;
+    //     goto exit;
+    // }
 
     do {
         err = mbedtls_ssl_handshake(&result.context->ssl);
     } while ((err == MBEDTLS_ERR_SSL_WANT_READ) || (err == MBEDTLS_ERR_SSL_WANT_WRITE));
 
     if (err != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_handshake returned %d\n\n", err));
+        lssDebugPrint(options, "mbedtls_ssl_handshake failed with %d\n", err);
         result.error_num = err;
         result.error_source = ERR_SRC_MBEDTLS;
         goto exit;
     }
 
     if ((err = mbedtls_ssl_get_verify_result(&result.context->ssl)) != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_get_verify_result returned %d\n\n", err));
+        lssDebugPrint(options, "mbedtls_ssl_get_verify_result failed with %d\n", err);
         result.error_num = err;
         result.error_source = ERR_SRC_MBEDTLS;
         goto exit;
@@ -217,7 +240,7 @@ lss_close_tls_connection(lss_tls_connection_context* context) {
     } while ((err == MBEDTLS_ERR_SSL_WANT_READ) || (err == MBEDTLS_ERR_SSL_WANT_WRITE));
 
     if (err != 0) {
-        MBEDTLS_SSL_DEBUG_MSG(1, (" failed\n  ! mbedtls_ssl_close_notify returned %d\n\n", err));
+        lssDebugPrint(NULL, "mbedtls_ssl_close_notify failed with %d\n", err);
         result.error_num = err;
         result.error_source = ERR_SRC_MBEDTLS;
     }

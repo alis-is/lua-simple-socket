@@ -32,6 +32,11 @@ mbedtls_recv(lss_tls_connection_context* context, void* pBuffer, size_t bytesToR
     if (pollStatus > 0) // socket is ready for reading
     {
         bytesReceived = mbedtls_ssl_read(&context->ssl, pBuffer, bytesToRecv);
+        // TODO: session tickets?
+        while (bytesReceived == MBEDTLS_ERR_SSL_WANT_READ || bytesReceived == MBEDTLS_ERR_SSL_WANT_WRITE
+               || bytesReceived == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            bytesReceived = mbedtls_ssl_read(&context->ssl, pBuffer, bytesToRecv);
+        };
     } else if (pollStatus < 0) // failed to poll
     {
         bytesReceived = -1;
