@@ -3,10 +3,10 @@
 #include <lua.h>
 #include <lualib.h>
 #include <stdlib.h>
+#include "lerror.h"
 #include "lss.h"
 #include "lss_options.h"
 #include "lss_transport.h"
-#include "lutil.h"
 
 static int loaded = 0;
 
