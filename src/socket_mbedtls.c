@@ -82,8 +82,8 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     result.context->write_timeout = options->write_timeout;
 
     char* seedString = "lsstls";
-    if (options->drbgSeed != NULL) {
-        seedString = options->drbgSeed;
+    if (options->drgb_seed != NULL) {
+        seedString = options->drgb_seed;
     }
     mbedtls_ctr_drbg_seed(&result.context->ctr_drbg, mbedtls_entropy_func, &result.context->entropy,
                           (const unsigned char*)seedString, strlen(seedString));
@@ -98,7 +98,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         goto exit;
     }
 
-    if (options->verifyPeer) {
+    if (options->verify_peer) {
         mbedtls_ssl_conf_authmode(&result.context->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
     } else {
         mbedtls_ssl_conf_authmode(&result.context->conf, MBEDTLS_SSL_VERIFY_NONE);
@@ -112,7 +112,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
 #endif
 
 #if defined(LSS_HAS_BUNDLED_ROOT_CERTIFICATES)
-    if (options->useBundledRootCertificates) {
+    if (options->use_bundled_root_certificates) {
         long unsigned int shift = 0;
         for (int i = 0; i < lss_cacertsCount; i++) {
             err = mbedtls_x509_crt_parse_der_nocopy(&result.context->cacert, lss_cacerts + shift, lss_cacertSizes[i]);
@@ -126,10 +126,10 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         }
     }
 #endif
-    if (options->caCertificates != NULL) {
-        for (int i = 0; i < options->caCertificates->count; i++) {
-            err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->caCertificates->certificates[i],
-                                             options->caCertificates->sizes[i]);
+    if (options->ca_certificates != NULL) {
+        for (int i = 0; i < options->ca_certificates->count; i++) {
+            err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->ca_certificates->certificates[i],
+                                             options->ca_certificates->sizes[i]);
             if (err != 0) {
                 lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
                 result.error_num = err;
@@ -139,18 +139,18 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         }
     }
 
-    if (options->clientCertificate != NULL) {
-        err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->clientCertificate->certificate,
-                                         options->clientCertificate->certificateSize);
+    if (options->client_certificate != NULL) {
+        err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->client_certificate->certificate,
+                                         options->client_certificate->certificateSize);
         if (err != 0) {
             lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
             result.error_num = err;
             result.error_source = ERR_SRC_MBEDTLS;
             goto exit;
         }
-        err = mbedtls_pk_parse_key(&result.context->pkey, options->clientCertificate->key,
-                                   options->clientCertificate->keySize, options->clientCertificate->password,
-                                   options->clientCertificate->passwordSize, mbedtls_ctr_drbg_random,
+        err = mbedtls_pk_parse_key(&result.context->pkey, options->client_certificate->key,
+                                   options->client_certificate->keySize, options->client_certificate->password,
+                                   options->client_certificate->passwordSize, mbedtls_ctr_drbg_random,
                                    &result.context->ctr_drbg);
         if (err != 0) {
             lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);

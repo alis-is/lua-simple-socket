@@ -56,10 +56,8 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
         fcntl(sd, F_SETFL, O_NONBLOCK);
 #endif
         int connect_timeout = 5 * 60 * 1000; // 5 minutes
-        if (options != NULL) {
-            if (options->connect_timeout > 0) {
-                connect_timeout = options->connect_timeout;
-            }
+        if (options != NULL && options->connect_timeout > 0) {
+            connect_timeout = options->connect_timeout;
         }
 
         int conn_result = connect(sd, addr->ai_addr, addr->ai_addrlen);

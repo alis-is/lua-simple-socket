@@ -44,12 +44,12 @@ typedef struct lss_open_tls_connection_options {
     int connect_timeout;
     int read_timeout;
     int write_timeout;
-    int useBundledRootCertificates;
-    char* drbgSeed;
+    int use_bundled_root_certificates;
+    char* drgb_seed;
     int debugLevel;
-    int verifyPeer;
-    lss_tls_ca_certificates* caCertificates;
-    lss_tls_client_certificate* clientCertificate;
+    int verify_peer;
+    lss_tls_ca_certificates* ca_certificates;
+    lss_tls_client_certificate* client_certificate;
 } lss_open_tls_connection_options;
 
 lss_tls_connection_result lss_open_tls_connection(const char* hostname, int portno,
