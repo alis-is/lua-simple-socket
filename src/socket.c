@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include "socket.h"
@@ -6,9 +7,9 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
-#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -25,11 +26,19 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
 #else
     int sd;
 #endif
-    int err;
+    int err = 0;
+    int connected = 0;
     struct addrinfo hints, *addrs;
     char portno_str[16];
 
     lss_connection_result result = {NULL, 0, ERR_SRC_NONE};
+
+    if (options != NULL && (options->connect_timeout < 0 || options->read_timeout < -1 || options->write_timeout < 0)) {
+        errno = EINVAL;
+        result.error_num = EINVAL;
+        result.error_source = ERR_SRC_ERRNO;
+        return result;
+    }
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -45,10 +54,30 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
     }
 
     for (struct addrinfo* addr = addrs; addr != NULL; addr = addr->ai_next) {
+#ifdef SOCK_CLOEXEC
+        sd = socket(addr->ai_family, addr->ai_socktype | SOCK_CLOEXEC, addr->ai_protocol);
+#else
         sd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+        if (sd != -1) {
+#ifdef _WIN32
+            SetHandleInformation((HANDLE)sd, HANDLE_FLAG_INHERIT, 0);
+#else
+            fcntl(sd, F_SETFD, FD_CLOEXEC);
+#endif
+        }
+#endif
         if (sd == -1) {
+#ifdef _WIN32
+            err = WSAGetLastError();
+#else
+            err = errno;
+#endif
             continue;
         }
+#ifdef SO_NOSIGPIPE
+        int one = 1;
+        setsockopt(sd, SOL_SOCKET, SO_NOSIGPIPE, (void*)&one, sizeof one);
+#endif
 #ifdef _WIN32
         u_long mode = 1; // 1 to enable non-blocking mode, 0 to disable
         ioctlsocket(sd, FIONBIO, &mode);
@@ -61,12 +90,13 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
         }
 
         int conn_result = connect(sd, addr->ai_addr, addr->ai_addrlen);
-        int connected = conn_result == 0;
+        connected = conn_result == 0;
 #ifdef _WIN32
-        if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        int in_progress = !connected && WSAGetLastError() == WSAEWOULDBLOCK;
 #else
-        if (errno == EINPROGRESS) {
+        int in_progress = !connected && errno == EINPROGRESS;
 #endif
+        if (in_progress) {
             struct pollfd pfd;
             pfd.fd = sd;
             pfd.events = POLLOUT;
@@ -75,18 +105,50 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
 #else
             switch (poll(&pfd, 1, connect_timeout)) {
 #endif
-                case -1: break; // error
-                case 0:         // connection timeout
+                case -1: // poll error
 #ifdef _WIN32
-                    errno = WSAETIMEDOUT;
+                    err = WSAGetLastError();
 #else
-                    errno = ETIMEDOUT;
+                    err = errno;
 #endif
-                    continue;
-                default: // success
-                    connected = 1;
                     break;
+                case 0: // connection timeout
+#ifdef _WIN32
+                    err = WSAETIMEDOUT;
+#else
+                    err = ETIMEDOUT;
+#endif
+                    break;
+                default: { // writable does not guarantee a successful connect
+                    int so_error = 0;
+#ifdef _WIN32
+                    int so_error_len = sizeof so_error;
+#else
+                    socklen_t so_error_len = sizeof so_error;
+#endif
+                    if (getsockopt(sd, SOL_SOCKET, SO_ERROR,
+                                   (void*)&so_error, &so_error_len) == 0) {
+                        if (so_error == 0) {
+                            connected = 1;
+                        } else {
+                            err = so_error;
+                        }
+                    } else {
+#ifdef _WIN32
+                        err = WSAGetLastError();
+#else
+                        err = errno;
+#endif
+                    }
+                    break;
+                }
             }
+        } else if (!connected) {
+#ifdef _WIN32
+            err = WSAGetLastError();
+#else
+            err = errno;
+#endif
         }
         if (connected) {
 #ifdef _WIN32
@@ -100,25 +162,35 @@ lss_open_connection(const char* hostname, int portno, lss_open_connection_option
         }
 
 #ifdef _WIN32
-        err = WSAGetLastError();
         closesocket(sd);
 #else
-        err = errno;
         close(sd);
 #endif
         sd = -1;
     }
 
     freeaddrinfo(addrs);
-    if (sd == -1) {
-        result.error_num = err;
+    if (!connected) {
+        result.error_num = err != 0 ? err : -1;
         result.error_source = ERR_SRC_ERRNO;
         return result;
     }
     result.context = malloc(sizeof(lss_connection_context));
+    if (result.context == NULL) {
+#ifdef _WIN32
+        DWORD close_err = closesocket(sd);
+        SetLastError(close_err != 0 ? WSAGetLastError() : ERROR_NOT_ENOUGH_MEMORY);
+        result.error_num = (int)GetLastError();
+#else
+        close(sd);
+        result.error_num = errno;
+#endif
+        result.error_source = ERR_SRC_ERRNO;
+        return result;
+    }
     result.context->sd = sd;
-    result.context->read_timeout = options->read_timeout;
-    result.context->write_timeout = options->write_timeout;
+    result.context->read_timeout = options != NULL ? options->read_timeout : 0;
+    result.context->write_timeout = options != NULL ? options->write_timeout : 0;
     return result;
 }
 
@@ -129,18 +201,19 @@ lss_close_connection(lss_connection_context* context) {
         return result;
     }
 #ifdef _WIN32
-    if (closesocket(context->sd) == 0) {
-        free(context);
-        return result;
+    if (closesocket(context->sd) != 0) {
+        result.error_num = (int)WSAGetLastError();
+        result.error_source = ERR_SRC_ERRNO;
+        SetLastError((DWORD)result.error_num);
     }
 #else
-    if (close(context->sd) == 0) {
-        free(context);
-        return result;
+    if (close(context->sd) != 0) {
+        result.error_num = errno;
+        result.error_source = ERR_SRC_ERRNO;
     }
 #endif
-    result.error_num = errno;
-    result.error_source = ERR_SRC_ERRNO;
+    context->sd = -1;
+    free(context);
 
     return result;
 }

@@ -1,86 +1,59 @@
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <errno.h>
-#include <poll.h>
-#include <sys/socket.h>
-#endif
+#include "lss_transport.h"
 #include "transport_mbedtls.h"
 
 int
 mbedtls_recv(lss_tls_connection_context* context, void* pBuffer, size_t bytesToRecv) {
-    int bytesReceived = -1, pollStatus = 1;
-#ifdef _WIN32
-    WSAPOLLFD pollFds;
-    pollFds.events = POLLIN;
-#else
-    struct pollfd pollFds;
-    pollFds.events = POLLIN | POLLPRI;
-#endif
-    pollFds.revents = 0;
-    pollFds.fd = context->socket.fd;
-
-    if (bytesToRecv == 1U || context->read_timeout > 0) {
-#ifdef _WIN32
-        pollStatus = WSAPoll(&pollFds, 1, context->read_timeout);
-#else
-        pollStatus = poll(&pollFds, 1, context->read_timeout);
-#endif
+    if (bytesToRecv == 0) return 0;
+    /* Preserve the one-byte probe used by corehttp; other default reads wait. */
+    uint64_t deadline = context->read_timeout > 0 ? lss_monotonic_ms() + context->read_timeout
+        : bytesToRecv == 1U && context->read_timeout == 0 ? lss_monotonic_ms() : UINT64_MAX;
+    for (;;) {
+        /* Read first so buffered plaintext is returned without polling. */
+        int received = mbedtls_ssl_read(&context->ssl, pBuffer, bytesToRecv);
+        if (received == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
+            if (deadline != UINT64_MAX && lss_monotonic_ms() >= deadline) return 0;
+            continue;
+        }
+        if (received == MBEDTLS_ERR_SSL_WANT_READ || received == MBEDTLS_ERR_SSL_WANT_WRITE) {
+            int err = lss_tls_wait(context, received, deadline);
+            if (err == MBEDTLS_ERR_SSL_TIMEOUT) return 0;
+            if (err != 0) return err;
+            continue;
+        }
+        if (received == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            /* Remember the authenticated close: the next read returns 0 even
+             * though the stream ended cleanly. */
+            context->clean_eof = 1;
+            return LSS_TRANSPORT_EOF;
+        }
+        if (received == 0) {
+            // TCP EOF without close_notify cannot authenticate a close-delimited body.
+            return context->clean_eof ? LSS_TRANSPORT_EOF : MBEDTLS_ERR_SSL_CONN_EOF;
+        }
+        return received;
     }
-
-    if (pollStatus > 0) // socket is ready for reading
-    {
-        bytesReceived = mbedtls_ssl_read(&context->ssl, pBuffer, bytesToRecv);
-        // TODO: session tickets?
-        while (bytesReceived == MBEDTLS_ERR_SSL_WANT_READ || bytesReceived == MBEDTLS_ERR_SSL_WANT_WRITE
-               || bytesReceived == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) {
-            bytesReceived = mbedtls_ssl_read(&context->ssl, pBuffer, bytesToRecv);
-        };
-    } else if (pollStatus < 0) // failed to poll
-    {
-        bytesReceived = -1;
-    } else { // socket is not ready for reading
-        bytesReceived = 0;
-    }
-
-    if ((pollStatus > 0) && (bytesReceived == 0)) {
-        // context closed
-        bytesReceived = -1;
-    }
-    return bytesReceived;
 }
 
 int
 mbedtls_send(lss_tls_connection_context* context, const void* pBuffer, size_t bytesToSend) {
-    int bytesSent = -1, pollStatus = -1;
-#ifdef _WIN32
-    WSAPOLLFD pollFds;
-#else
-    struct pollfd pollFds;
-#endif
+    uint64_t deadline = context->write_timeout > 0 ? lss_monotonic_ms() + context->write_timeout : UINT64_MAX;
+    return mbedtls_send_until(context, pBuffer, bytesToSend, deadline);
+}
 
-    // return mbedtls_ssl_write(&context->ssl, pBuffer, bytesToSend);
-    pollFds.events = POLLOUT;
-    pollFds.revents = 0;
-    pollFds.fd = context->socket.fd;
-
-#ifdef _WIN32
-    pollStatus = WSAPoll(&pollFds, 1, context->write_timeout);
-#else
-    pollStatus = poll(&pollFds, 1, context->write_timeout);
-#endif
-
-    if (pollStatus > 0) // socket is ready for writing
-    {
-        bytesSent = mbedtls_ssl_write(&context->ssl, pBuffer, bytesToSend);
-    } else if (pollStatus < 0) // failed to poll
-    {
-        bytesSent = -1;
-    } else // socket is not ready for writing
-    {
-        bytesSent = 0;
+int
+mbedtls_send_until(lss_tls_connection_context* context, const void* pBuffer, size_t bytesToSend, uint64_t deadline) {
+    if (bytesToSend == 0) return 0;
+    if (deadline != UINT64_MAX && lss_monotonic_ms() >= deadline) return MBEDTLS_ERR_SSL_TIMEOUT;
+    for (;;) {
+        int sent = mbedtls_ssl_write(&context->ssl, pBuffer, bytesToSend);
+        if (sent != MBEDTLS_ERR_SSL_WANT_READ && sent != MBEDTLS_ERR_SSL_WANT_WRITE) return sent;
+        /* Retry with identical arguments as required by mbedtls. A timeout is
+         * an error, not zero progress that Lua's write loop would retry forever. */
+        int err = lss_tls_wait(context, sent, deadline);
+        if (err != 0) {
+            /* A pending TLS write cannot be retried with different data. */
+            mbedtls_net_free(&context->socket);
+            return err;
+        }
     }
-
-    return bytesSent;
 }

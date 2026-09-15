@@ -10,6 +10,8 @@
 
 lss_open_connection_options* lss_load_plaintext_connection_options(lua_State* L);
 void lss_free_plain_connection_options(lss_open_connection_options* options);
+/* Top of stack is an options table. NULL means allocation failure (ENOMEM),
+ * never default options. Partial allocations are freed and the stack restored. */
 lss_open_tls_connection_options* lss_load_tls_connection_options(lua_State* L);
 void lss_free_tls_connection_options(lss_open_tls_connection_options* options);
 

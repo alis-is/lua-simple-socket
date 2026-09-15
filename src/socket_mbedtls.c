@@ -5,16 +5,30 @@
 
 #include "socket.h"
 #include "socket_mbedtls.h"
+#include "lss_runtime.h"
 #if defined(LSS_HAS_BUNDLED_ROOT_CERTIFICATES)
 #include "certs.h"
 #endif
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include "mbedtls/platform.h"
 #include "mbedtls/ssl.h"
 #if defined(MBEDTLS_DEBUG_C)
 #include "mbedtls/debug.h"
 #endif
 #include "psa/crypto.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+#endif
 
 void
 free_connection(lss_tls_connection_context* context) {
@@ -32,6 +46,89 @@ free_connection(lss_tls_connection_context* context) {
 void
 mbedtlsDebugPrint(void* ctx, int level, const char* pFile, int line, const char* pStr) {
     printf("mbedtlsDebugPrint: |%d| %s\n", level, pStr);
+}
+
+#ifdef _WIN32
+typedef WSAPOLLFD lss_pollfd;
+#else
+typedef struct pollfd lss_pollfd;
+#endif
+
+uint64_t
+lss_monotonic_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000U + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+int
+lss_tls_wait(lss_tls_connection_context* context, int want, uint64_t deadline) {
+    for (;;) {
+        lss_pollfd pfd;
+        int poll_timeout = -1;
+        if (deadline != UINT64_MAX) {
+            uint64_t now = lss_monotonic_ms();
+            if (now >= deadline) return MBEDTLS_ERR_SSL_TIMEOUT;
+            uint64_t remaining = deadline - now;
+            poll_timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        }
+        pfd.fd = context->socket.fd;
+        pfd.events = want == MBEDTLS_ERR_SSL_WANT_READ ? POLLIN : POLLOUT;
+        pfd.revents = 0;
+#ifdef _WIN32
+        if (WSAPoll(&pfd, 1, poll_timeout) < 0) {
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+        if (poll(&pfd, 1, poll_timeout) < 0) {
+            if (errno == EINTR) continue;
+#endif
+            return want == MBEDTLS_ERR_SSL_WANT_READ ? MBEDTLS_ERR_NET_RECV_FAILED
+                                                    : MBEDTLS_ERR_NET_SEND_FAILED;
+        }
+        if (pfd.revents & POLLNVAL) return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+        return pfd.revents == 0 ? MBEDTLS_ERR_SSL_TIMEOUT : 0;
+    }
+}
+
+#ifdef MSG_NOSIGNAL
+static int
+lss_net_send(void* ctx, const unsigned char* buf, size_t len) {
+    int fd = ((mbedtls_net_context*)ctx)->fd;
+    int ret = (int)send(fd, buf, len, MSG_NOSIGNAL);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return MBEDTLS_ERR_SSL_WANT_WRITE;
+        if (errno == EPIPE || errno == ECONNRESET) return MBEDTLS_ERR_NET_CONN_RESET;
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    return ret;
+}
+#endif
+
+static int
+lss_tls_handshake(lss_tls_connection_context* context, int timeout_ms) {
+    uint64_t deadline = lss_monotonic_ms() + (uint64_t)timeout_ms;
+    int err = mbedtls_net_set_nonblock(&context->socket);
+    if (err != 0) return err;
+    /* Keep the BIO nonblocking for the entire connection: readiness does not
+     * guarantee that a complete TLS record is available. */
+    mbedtls_ssl_set_bio(&context->ssl, &context->socket,
+#ifdef MSG_NOSIGNAL
+                        lss_net_send,
+#else
+                        mbedtls_net_send,
+#endif
+                        mbedtls_net_recv, NULL);
+    for (;;) {
+        err = mbedtls_ssl_handshake(&context->ssl);
+        if (err != MBEDTLS_ERR_SSL_WANT_READ && err != MBEDTLS_ERR_SSL_WANT_WRITE) break;
+        err = lss_tls_wait(context, err, deadline);
+        if (err != 0) break;
+    }
+    return err;
 }
 
 void
@@ -58,6 +155,25 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     char portno_str[16];
 
     lss_tls_connection_result result = {NULL, 0, ERR_SRC_NONE};
+
+    if (options != NULL && (options->connect_timeout < 0 || options->read_timeout < -1 || options->write_timeout < 0)) {
+        errno = EINVAL;
+        result.error_num = EINVAL;
+        result.error_source = ERR_SRC_ERRNO;
+        return result;
+    }
+
+    if (eli_tls_initialize() != 0) {
+        /* threading mutexes or PSA failed to initialize */
+        result.error_num = errno != 0 ? errno : EIO;
+        result.error_source = ERR_SRC_ERRNO;
+        return result;
+    }
+
+    if (options == NULL) {
+        options = &defaultOptions;
+    }
+
     result.context = malloc(sizeof(lss_tls_connection_context));
     if (result.context == NULL) {
         result.error_num = errno;
@@ -65,11 +181,6 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
         goto exit;
     }
 
-    if (options == NULL) {
-        options = &defaultOptions;
-    }
-
-    psa_crypto_init(); // mbedtls 3.6.0+
     mbedtls_net_init(&result.context->socket);
     mbedtls_ssl_init(&result.context->ssl);
     mbedtls_ssl_config_init(&result.context->conf);
@@ -80,13 +191,20 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     mbedtls_pk_init(&result.context->pkey);
     result.context->read_timeout = options->read_timeout;
     result.context->write_timeout = options->write_timeout;
+    result.context->clean_eof = 0;
 
     char* seedString = "lsstls";
     if (options->drgb_seed != NULL) {
         seedString = options->drgb_seed;
     }
-    mbedtls_ctr_drbg_seed(&result.context->ctr_drbg, mbedtls_entropy_func, &result.context->entropy,
-                          (const unsigned char*)seedString, strlen(seedString));
+    if ((err = mbedtls_ctr_drbg_seed(&result.context->ctr_drbg, mbedtls_entropy_func, &result.context->entropy,
+                                     (const unsigned char*)seedString, strlen(seedString)))
+        != 0) {
+        lssDebugPrint(options, "mbedtls_ctr_drbg_seed failed with %d\n", err);
+        result.error_num = err;
+        result.error_source = ERR_SRC_MBEDTLS;
+        goto exit;
+    }
     snprintf(portno_str, sizeof(portno_str), "%d", portno);
 
     if ((err = mbedtls_ssl_config_defaults(&result.context->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -140,7 +258,7 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     }
 
     if (options->client_certificate != NULL) {
-        err = mbedtls_x509_crt_parse_der(&result.context->cacert, options->client_certificate->certificate,
+        err = mbedtls_x509_crt_parse_der(&result.context->clicert, options->client_certificate->certificate,
                                          options->client_certificate->certificateSize);
         if (err != 0) {
             lssDebugPrint(options, "mbedtls_x509_crt_parse_file Failed. mbedtlsError = %d\n", err);
@@ -192,9 +310,6 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     result.context->socket.fd = connResult.context->sd;
     free(connResult.context); // we don't need it anymore, we use tls context now
 
-    mbedtls_ssl_set_bio(&result.context->ssl, (void*)&result.context->socket, mbedtls_net_send, mbedtls_net_recv,
-                        mbedtls_net_recv_timeout);
-
     // fails in 3.6.0 with tls1.3 - unsupported extension
     // if ((err = mbedtls_ssl_conf_max_frag_len(&result.context->conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096)) != 0) {
     //     lssDebugPrint(options, "mbedtls_ssl_conf_max_frag_len failed with %d\n", err);
@@ -203,9 +318,8 @@ lss_open_tls_connection(const char* hostname, int portno, lss_open_tls_connectio
     //     goto exit;
     // }
 
-    do {
-        err = mbedtls_ssl_handshake(&result.context->ssl);
-    } while ((err == MBEDTLS_ERR_SSL_WANT_READ) || (err == MBEDTLS_ERR_SSL_WANT_WRITE));
+    err = lss_tls_handshake(result.context,
+                            options->connect_timeout > 0 ? options->connect_timeout : 5 * 60 * 1000);
 
     if (err != 0) {
         lssDebugPrint(options, "mbedtls_ssl_handshake failed with %d\n", err);
@@ -235,9 +349,14 @@ lss_tls_connection_result
 lss_close_tls_connection(lss_tls_connection_context* context) {
     int err;
     lss_tls_connection_result result = {NULL, 0, ERR_SRC_NONE};
-    do {
+    /* ponytail: default close is best effort; an explicit write timeout bounds retries. */
+    uint64_t deadline = lss_monotonic_ms() + (context->write_timeout > 0 ? context->write_timeout : 0);
+    for (;;) {
         err = mbedtls_ssl_close_notify(&context->ssl);
-    } while ((err == MBEDTLS_ERR_SSL_WANT_READ) || (err == MBEDTLS_ERR_SSL_WANT_WRITE));
+        if (err != MBEDTLS_ERR_SSL_WANT_READ && err != MBEDTLS_ERR_SSL_WANT_WRITE) break;
+        err = lss_tls_wait(context, err, deadline);
+        if (err != 0) break;
+    }
 
     if (err != 0) {
         lssDebugPrint(NULL, "mbedtls_ssl_close_notify failed with %d\n", err);
