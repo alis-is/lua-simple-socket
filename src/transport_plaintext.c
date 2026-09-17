@@ -7,6 +7,7 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 #else
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
 #endif
@@ -68,6 +69,20 @@ plaintext_send_until(lss_connection_context* context, const void* pBuffer, size_
     if (ioctlsocket(context->sd, FIONBIO, &mode) != 0) return -1;
     WSAPOLLFD pfd;
 #else
+    /* macOS only honors MSG_DONTWAIT for the send-buffer lock; a buffer-full
+     * send still parks in sbwait, so a timed send must use O_NONBLOCK to stay
+     * bounded.
+     * ponytail: the O_NONBLOCK flip is not safe if a socket is shared across
+     * threads, same as the Windows FIONBIO flip above. */
+    int saved_flags = -1;
+    if (deadline != UINT64_MAX) {
+        saved_flags = fcntl(context->sd, F_GETFL);
+        if (saved_flags >= 0 && !(saved_flags & O_NONBLOCK)) {
+            fcntl(context->sd, F_SETFL, saved_flags | O_NONBLOCK);
+        } else {
+            saved_flags = -1;
+        }
+    }
     struct pollfd pfd;
 #endif
     for (;;) {
@@ -108,6 +123,8 @@ plaintext_send_until(lss_connection_context* context, const void* pBuffer, size_
 #ifdef _WIN32
     mode = 0;
     if (ioctlsocket(context->sd, FIONBIO, &mode) != 0) return -1;
+#else
+    if (saved_flags != -1) fcntl(context->sd, F_SETFL, saved_flags);
 #endif
     return sent > 0 ? sent : -1;
 }

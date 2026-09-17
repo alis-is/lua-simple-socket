@@ -57,8 +57,14 @@ int main(void) {
     int sent = lss_send(&conn, data, length);
     assert(sent > 0 && (size_t)sent < length);
     assert(lss_monotonic_ms() - start < 1000);
+    /* MSG_DONTWAIT is not honoured for buffer-full sends on macOS, so the
+     * socket itself must be non-blocking while the buffer is filled. */
+    int blocking = fcntl(pair[0], F_GETFL);
+    assert(blocking >= 0);
+    assert(fcntl(pair[0], F_SETFL, blocking | O_NONBLOCK) == 0);
     while (send(pair[0], data, length, MSG_DONTWAIT) > 0) {}
     assert(errno == EAGAIN || errno == EWOULDBLOCK);
+    assert(fcntl(pair[0], F_SETFL, blocking) == 0);
     start = lss_monotonic_ms();
     assert(lss_send(&conn, data, length) < 0);
     bounded(start);
